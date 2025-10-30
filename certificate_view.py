@@ -9,7 +9,6 @@ from tkinter import ttk, messagebox
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 from tdms_reader import (
-    NPTDMS_OK,
     read_contract_and_loop_data,
     read_performance_tables_dynamic,
 )
@@ -201,42 +200,42 @@ def open_detail_window(root, columns, values, meta):
         item = pump = sn = imp_draw = imp_mat = imp_dia = "—"
         suction = discharge = watt_const = atmpress = knpsh = watertemp = kventuri = "—"
 
-        if NPTDMS_OK and tdms_path and os.path.exists(tdms_path):
-            try:
-                data = read_contract_and_loop_data(tdms_path)
-                # Contractual
-                cap     = _fmt_if_number(data.get("Capacity [m3/h]", ""))
-                tdh     = _fmt_if_number(data.get("TDH [m]", ""))
-                eff     = _fmt_if_number(data.get("Efficiency [%]", ""))
-                abs_pow = _fmt_if_number(data.get("ABS_Power [kW]", ""))
-                speed   = _fmt_if_number(data.get("Speed [rpm]", ""))
-                sg      = _fmt_if_number(data.get("SG Contract", ""))
-                temp    = _fmt_if_number(data.get("Temperature [°C]", ""))
-                visc    = _fmt_if_number(data.get("Viscosity [cP]", ""))
-                npsh    = _fmt_if_number(data.get("NPSH [m]", ""))
-                liquid  = data.get("Liquid", "") or "—"
+        try:
+            data = read_contract_and_loop_data(tdms_path)
+        except Exception:
+            data = {}
 
-                cust    = data.get("Customer", "") or "—"
-                po      = data.get("Purchaser Order", "") or "—"
-                end_user= data.get("End User", "") or "—"
-                specs   = data.get("Applic. Specs.", "") or "—"
+        # Contractual
+        cap     = _fmt_if_number(data.get("Capacity [m3/h]", ""))
+        tdh     = _fmt_if_number(data.get("TDH [m]", ""))
+        eff     = _fmt_if_number(data.get("Efficiency [%]", ""))
+        abs_pow = _fmt_if_number(data.get("ABS_Power [kW]", ""))
+        speed   = _fmt_if_number(data.get("Speed [rpm]", ""))
+        sg      = _fmt_if_number(data.get("SG Contract", ""))
+        temp    = _fmt_if_number(data.get("Temperature [°C]", ""))
+        visc    = _fmt_if_number(data.get("Viscosity [cP]", ""))
+        npsh    = _fmt_if_number(data.get("NPSH [m]", ""))
+        liquid  = data.get("Liquid", "") or "—"
 
-                item    = data.get("Item", "") or "—"
-                pump    = data.get("Pump", "") or "—"
-                sn      = data.get("Serial Number_Elenco", "") or "—"
-                imp_draw= data.get("Impeller Drawing", "") or "—"
-                imp_mat = data.get("Impeller Material", "") or "—"
-                imp_dia = data.get("Diam Nominal", "") or "—"
+        cust     = data.get("Customer", "") or "—"
+        po       = data.get("Purchaser Order", "") or "—"
+        end_user = data.get("End User", "") or "—"
+        specs    = data.get("Applic. Specs.", "") or "—"
 
-                suction     = _fmt_if_number(data.get("Suction [Inch]", ""))
-                discharge   = _fmt_if_number(data.get("Discharge [Inch]", ""))
-                watt_const  = _fmt_if_number(data.get("Wattmeter Const.", ""))
-                atmpress    = _fmt_if_number(data.get("AtmPress [m]", ""))
-                knpsh       = _fmt_if_number(data.get("KNPSH [m]", ""))
-                watertemp   = _fmt_if_number(data.get("WaterTemp [°C]", ""))
-                kventuri    = _fmt_if_number(data.get("KVenturi", ""))
-            except Exception:
-                pass
+        item     = data.get("Item", "") or "—"
+        pump     = data.get("Pump", "") or "—"
+        sn       = data.get("Serial Number_Elenco", "") or "—"
+        imp_draw = data.get("Impeller Drawing", "") or "—"
+        imp_mat  = data.get("Impeller Material", "") or "—"
+        imp_dia  = data.get("Diam Nominal", "") or "—"
+
+        suction     = _fmt_if_number(data.get("Suction [Inch]", ""))
+        discharge   = _fmt_if_number(data.get("Discharge [Inch]", ""))
+        watt_const  = _fmt_if_number(data.get("Wattmeter Const.", ""))
+        atmpress    = _fmt_if_number(data.get("AtmPress [m]", ""))
+        knpsh       = _fmt_if_number(data.get("KNPSH [m]", ""))
+        watertemp   = _fmt_if_number(data.get("WaterTemp [°C]", ""))
+        kventuri    = _fmt_if_number(data.get("KVenturi", ""))
 
         contractual = tk.LabelFrame(blocks, text="Contractual Data", bg="#f0f0f0")
         contractual.grid(row=0, column=0, sticky="nsew", padx=(0,8))
@@ -276,11 +275,14 @@ def open_detail_window(root, columns, values, meta):
         for w in tables_row.winfo_children():
             w.destroy()
 
-        perf = read_performance_tables_dynamic(tdms_path, test_index=0) if tdms_path else {
-            "Recorded": {"columns": [], "rows": []},
-            "Calc": {"columns": [], "rows": []},
-            "Converted": {"columns": [], "rows": []},
-        }
+        try:
+            perf = read_performance_tables_dynamic(tdms_path, test_index=0)
+        except Exception:
+            perf = {
+                "Recorded": {"columns": [], "rows": []},
+                "Calc": {"columns": [], "rows": []},
+                "Converted": {"columns": [], "rows": []},
+            }
         rec_cols, rec_rows    = perf["Recorded"]["columns"], perf["Recorded"]["rows"]
         calc_cols, calc_rows  = perf["Calc"]["columns"],     perf["Calc"]["rows"]
         conv_cols, conv_rows  = perf["Converted"]["columns"], perf["Converted"]["rows"]
