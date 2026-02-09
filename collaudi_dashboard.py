@@ -1,4 +1,4 @@
-# collaudi_dashboard_db.py
+# collaudi_dashboard.py
 import os
 import re
 import sys
