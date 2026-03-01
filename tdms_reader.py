@@ -8,14 +8,15 @@ Espone:
 - NPTDMS_OK : bool
 - read_tdms_fields(tdms_path) -> {"n_collaudo": str, "tipo_pompa": str}
 - read_scalar_string(tdms_path, group, channel) -> str
-- read_contract_and_loop_data(tdms_path) -> dict[str,str]
+- read_contract_and_loop_data(tdms_path) -> dict[str,str]  # include "FSG ORDER"
 - read_performance_tables_dynamic(tdms_path, test_index=0) -> dict
+    # NOTA: da questa versione, le "rows" contengono valori **RAW** (float o "")
+- read_curve_data(tdms_path, test_index=0) -> (meta: dict, points: list)  # meta-only (points=[])
 """
 
 import os
 import re
 import math
-import re as _re
 from collections import defaultdict
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
@@ -51,6 +52,30 @@ def _first_nonempty(seq):
         if s:
             return s
     return ""
+
+def _to_float_safe(v):
+    """Converte in float in modo robusto (virgole, testo misto, unità)."""
+    try:
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", errors="ignore")
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            s = s.replace("\u00a0", " ")
+            # Estrai il primo token numerico, utile per stringhe tipo "12,34 bar"
+            m = re.search(r"[-+]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?", s)
+            if not m:
+                return None
+            token = m.group(0).replace(",", ".")
+            f = float(token)
+        else:
+            f = float(v)
+        if math.isfinite(f):
+            return f
+    except Exception:
+        return None
+    return None
 
 def _get_group_ci(tdms, group_name: str):
     tgt = (group_name or "").lower()
@@ -165,10 +190,66 @@ def _read_scalar_from_tdms(tdms, group_name: str, channel_name: str) -> str:
     except Exception:
         return ""
 
+def _read_fsg_order(tdms) -> str:
+    """
+    Legge FSG ORDER da:
+      - gruppo:  'Ref. Test Param.'
+      - canali:  'FSG Order_Value' (indice) e 'FSG Order_Elenco' (lista)
+    Usa il campione in posizione indicata da FSG Order_Value.
+    Gestisce indici 1-based e 0-based in modo robusto.
+    """
+    try:
+        grp = _get_group_ci(tdms, "Ref. Test Param.")
+        if not grp:
+            return ""
+        ch_val = _get_channel_ci(grp, "FSG Order_Value")
+        ch_list = _get_channel_ci(grp, "FSG Order_Elenco")
+        if not ch_val or not ch_list:
+            return ""
+
+        try:
+            vals = ch_val[:]
+        except Exception:
+            vals = getattr(ch_val, "data", [])
+        try:
+            elenco = ch_list[:]
+        except Exception:
+            elenco = getattr(ch_list, "data", [])
+
+        idx_raw = _first_nonempty(vals)
+        if not idx_raw:
+            return ""
+        try:
+            idx_num = int(str(idx_raw).strip())
+        except Exception:
+            try:
+                idx_num = int(float(str(idx_raw).replace(",", ".").strip()))
+            except Exception:
+                return ""
+
+        elenco_str = []
+        for x in elenco:
+            s = _first_nonempty([x])
+            if s is None:
+                s = ""
+            elenco_str.append(str(s).strip())
+
+        n = len(elenco_str)
+        if n == 0:
+            return ""
+        if 1 <= idx_num <= n:
+            return elenco_str[idx_num - 1] or ""
+        if 0 <= idx_num < n:
+            return elenco_str[idx_num] or ""
+        return ""
+    except Exception:
+        return ""
+
 def read_contract_and_loop_data(tdms_path: str) -> dict:
     """
     Ritorna un dict con i principali campi per Contractual / Test Param / Pump Type / Test Detail.
     Le unità sono parte del nome canale, non vengono rimosse.
+    Include anche "FSG ORDER" derivato da FSG Order_Value/Elenco.
     """
     out = {
         # Contract data
@@ -176,7 +257,7 @@ def read_contract_and_loop_data(tdms_path: str) -> dict:
         "Speed [rpm]": "", "SG Contract": "", "Temperature [°C]": "", "Viscosity [cP]": "",
         "NPSH [m]": "", "Liquid": "",
         # Test param
-        "Customer": "", "Purchaser Order": "", "End User": "", "Applic. Specs.": "",
+        "FSG ORDER": "", "Customer": "", "Purchaser Order": "", "End User": "", "Applic. Specs.": "",
         # Pump type
         "Item": "", "Pump": "", "Serial Number_Elenco": "", "Impeller Drawing": "",
         "Impeller Material": "", "Diam Nominal": "",
@@ -209,6 +290,7 @@ def read_contract_and_loop_data(tdms_path: str) -> dict:
         out["Purchaser Order"] = _read_scalar_from_tdms(tdms, "Ref. Test Param.", "Purchaser Order")
         out["End User"]        = _read_scalar_from_tdms(tdms, "Ref. Test Param.", "End User")
         out["Applic. Specs."]  = _read_scalar_from_tdms(tdms, "Ref. Test Param.", "Applic. Specs.")
+        out["FSG ORDER"]       = _read_fsg_order(tdms)
 
         # Pump Type
         out["Item"]                = _read_scalar_from_tdms(tdms, "Ref. Pump Type", "Item")
@@ -238,7 +320,7 @@ def read_contract_and_loop_data(tdms_path: str) -> dict:
 # -------------------- Performance tables (NO units) --------------------
 GROUP_RE = re.compile(
     r"^(?P<test>\d+)_(?P<point>\d+)_"
-    r"(?P<prefix>PERFORMANCE_PERFORM)"
+    r"(?P<prefix>PERFORMANCE_PERFORM|NPSH_NPSH|RUNNING_RUNNING)"
     r"_(?:Test_)?(?P<kind>Recorded|Calc|Converted)$"
 )
 KIND_ORDER = ("Recorded", "Calc", "Converted")
@@ -250,62 +332,49 @@ def _normalize_channel_name(ch_name: str) -> str:
         return "—"
     return re.sub(r"\s+", " ", name).strip()
 
-def _fmt_num(x):
-    try:
-        d = Decimal(str(x))
-    except Exception:
-        return ""
-    try:
-        q = d.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-    except InvalidOperation:
-        return ""
-    try:
-        if not math.isfinite(float(q)):
-            return ""
-    except Exception:
-        return ""
-    s = format(q, "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s
-
 def _mean_all_strict(data):
     if NUMPY_OK:
         try:
             a = np.asarray(data, dtype=float)
         except Exception:
-            return 0.0
+            # Fallback robusto per canali stringa/misti.
+            s, c = _nan_sum_and_count(data)
+            return (s / c) if c else None
         if a.size == 0:
-            return 0.0
+            return None
         a = a.copy()
         mask = ~np.isfinite(a)
         if mask.any():
             a[mask] = 0.0
-        return float(np.mean(a))
+        return float(np.mean(a)) if a.size else None
     seq = data if hasattr(data, "__iter__") and not isinstance(data, (str, bytes, bytearray)) else [data]
     total = 0.0
     n = 0
     for v in seq:
-        try:
-            f = float(v)
-        except Exception:
-            f = 0.0
-        if math.isfinite(f):
+        f = _to_float_safe(v)
+        if f is not None:
             total += f
         n += 1
-    return (total / n) if n else 0.0
+    return (total / n) if n else None
 
 def _nan_sum_and_count(a):
     if NUMPY_OK:
         try:
             finite = np.isfinite(a)
         except Exception:
+            # Fallback robusto per sequenze non numeriche (es. stringhe con unità/virgole)
+            s = 0.0
+            c = 0
             try:
-                import numpy as _np
-                a = _np.asarray(list(a), dtype=float)
-                finite = _np.isfinite(a)
+                seq = list(a)
             except Exception:
-                return 0.0, 0
+                seq = [a]
+            for v in seq:
+                f = _to_float_safe(v)
+                if f is not None:
+                    s += f
+                    c += 1
+            return s, c
         if not any(finite):
             return 0.0, 0
         s = float(a[finite].sum())
@@ -313,12 +382,10 @@ def _nan_sum_and_count(a):
         return s, c
     s = 0.0; c = 0
     for v in a:
-        try:
-            f = float(v)
-        except Exception:
-            continue
-        if math.isfinite(f):
-            s += f; c += 1
+        f = _to_float_safe(v)
+        if f is not None:
+            s += f
+            c += 1
     return s, c
 
 def _mean_channel_fast(ch, chunk_size=2_000_000):
@@ -351,8 +418,11 @@ def _mean_channel_fast(ch, chunk_size=2_000_000):
             try:
                 arr = np.asarray(part, dtype=np.float32, order="C")
             except Exception:
-                import numpy as _np
-                arr = _np.array([], dtype=_np.float32)
+                # Fallback robusto: canali stringa (es. "12,34") o mixed types.
+                s, c = _nan_sum_and_count(part)
+                total += s
+                count += c
+                continue
         else:
             arr = list(part)
 
@@ -361,7 +431,7 @@ def _mean_channel_fast(ch, chunk_size=2_000_000):
         count += c
 
     if count == 0:
-        return 0.0
+        return None
     return total / count
 
 def _collect_perf_points(tdms, test_index: int = 0):
@@ -378,7 +448,11 @@ def _collect_perf_points(tdms, test_index: int = 0):
     return dict(points)
 
 def _build_kind_model(groups_by_point: dict):
-    """Costruisce columns (nomi canale, duplicati con __2, __3...) e rows (medie)."""
+    """
+    Costruisce:
+      - columns: lista intestazioni (con eventuali duplicati __2, __3, ...)
+      - rows:    lista di tuple con **valori RAW** (float, oppure "" se assente)
+    """
     first_seen_order = []
     max_dups = defaultdict(int)
 
@@ -405,7 +479,7 @@ def _build_kind_model(groups_by_point: dict):
             col = key if i == 1 else f"{key}__{i}"
             columns.append(col)
 
-    # Righe (per ogni point)
+    # Righe (per ogni point) → **raw float** (niente formattazione qui)
     rows = []
     for p in sorted(groups_by_point.keys()):
         seq = defaultdict(int)
@@ -425,7 +499,8 @@ def _build_kind_model(groups_by_point: dict):
                     except Exception:
                         data = getattr(ch, "data", [])
                     mean_val = _mean_all_strict(data)
-                row_map[col] = _fmt_num(mean_val)
+                row_map[col] = ("" if mean_val is None else mean_val)  # RAW float o vuoto
+        # se una colonna non è presente per quel point, metto stringa vuota
         rows.append(tuple(row_map.get(c, "") for c in columns))
 
     return columns, rows
@@ -434,10 +509,13 @@ def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
     """
     Ritorna (senza 'units'):
     {
-      "Recorded":  {"columns": [...], "rows": [tuple,...]},
+      "Recorded":  {"columns": [...], "rows": [tuple,...]},   # rows con float/""
       "Calc":      {"columns": [...], "rows": [...]},
       "Converted": {"columns": [...], "rows": [...]}
     }
+    
+    Per "Recorded": usa Perfor_Table_Label da Info_Table se disponibile,
+    altrimenti fallback ai nomi dei canali.
     """
     out = {k: {"columns": [], "rows": []} for k in ("Recorded", "Calc", "Converted")}
     if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
@@ -455,9 +533,32 @@ def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
             for k in ("Recorded", "Calc", "Converted"):
                 if kinds[k]:
                     by_kind[k][p].extend(kinds[k])
+        
+        # Leggi le label personalizzate SOLO per PERFORMANCE (test_index=0)
+        # Info_Table e Perfor_Table_Label non sono validi per NPSH/RUNNING
+        custom_labels = []
+        if test_index == 0:
+            custom_labels = read_perfor_table_labels(tdms_path)
+        
         for k in ("Recorded", "Calc", "Converted"):
             if by_kind[k]:
                 cols, rows = _build_kind_model(by_kind[k])
+                
+                # Usa custom labels solo per Recorded di PERFORMANCE
+                if k == "Recorded" and custom_labels and test_index == 0:
+                    # Sostituisci le colonne con le label personalizzate
+                    # Se ci sono meno label che colonne, usa le label disponibili
+                    # Se ci sono più label che colonne, usa solo quelle necessarie
+                    num_cols = len(cols)
+                    num_labels = len(custom_labels)
+                    
+                    if num_labels >= num_cols:
+                        # Usa le prime num_cols label
+                        cols = custom_labels[:num_cols]
+                    else:
+                        # Usa tutte le label disponibili, poi fallback ai nomi originali
+                        cols = custom_labels + cols[num_labels:]
+                
                 out[k]["columns"] = cols
                 out[k]["rows"]    = rows
         return out
@@ -466,40 +567,16 @@ def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
             tdms.close()
         except Exception:
             pass
-            
-# -------------------- Curve data (Contractual + punti Converted) --------------------
-def _clean_name_for_curve(s: str) -> str:
-    if not s:
-        return ""
-    s = _re.sub(r"\[[^\]]*\]", "", s)         # rimuovi eventuali unità tra [ ]
-    s = _re.sub(r"\s+", " ", s).strip()       # normalizza spazi
-    return s
 
-def _tag_curve_channel(ch) -> str | None:
-    """
-    Riconosce il canale come 'flow' (y) o 'tdh' (x) in modo robusto.
-    Esempi accettati (case-insensitive):
-      - flow/capacity/q   -> 'flow'
-      - tdh/head/h        -> 'tdh'
-    """
-    name = _clean_name_for_curve(getattr(ch, "name", "") or "").lower()
-    if not name:
-        return None
-    if name.startswith("flow") or name.startswith("capacity") or name == "q" or name.startswith("q "):
-        return "flow"
-    if name.startswith("tdh") or name.startswith("head") or name == "h" or name.startswith("h "):
-        return "tdh"
-    return None
 
+# -------------------- Curve data — META-ONLY (points deprecati) --------------------
 def read_curve_data(tdms_path: str, test_index: int = 0) -> tuple[dict, list[tuple[float, float]]]:
     """
     Restituisce:
       - meta: dict con principali valori contrattuali (stringhe); chiavi:
           capacity, tdh, eff, abs_pow, speed, sg, temp, visc, npsh, liquid
-      - points: lista di (x=TDH [m], y=Flow [m3/h]) in float, calcolati come media per point dai gruppi Converted.
-    Se il file non è valido/leggibile, points = [] e meta contiene '—' o stringhe vuote.
+      - points: **DEPRECATO** → sempre lista vuota (le curve ora usano read_performance_tables_dynamic)
     """
-    # meta dalle funzioni già esistenti (riuso)
     raw = read_contract_and_loop_data(tdms_path) if tdms_path else {}
     meta = {
         "capacity": raw.get("Capacity [m3/h]", "") or "—",
@@ -513,50 +590,251 @@ def read_curve_data(tdms_path: str, test_index: int = 0) -> tuple[dict, list[tup
         "npsh":     raw.get("NPSH [m]", "") or "—",
         "liquid":   raw.get("Liquid", "") or "—",
     }
+    return meta, []  # points non più usati
 
-    points: list[tuple[float, float]] = []
+
+# -------------------- Power Calc Type (Info_Table) --------------------
+def read_power_calc_type(tdms_path: str) -> str:
+    """
+    Legge il tipo di calcolo potenza dal gruppo Info_Table.
+    
+    Legge:
+      - Power_Calc_Type_Value: indice (0, 1, 2, ...)
+      - Power_Calc_Type_Elenco: lista di stringhe
+    
+    Restituisce la stringa corrispondente all'indice.
+    
+    Args:
+        tdms_path: Percorso del file TDMS
+    
+    Returns:
+        str: Descrizione del tipo di calcolo (es. "Wattmeter", "Torquemeter", ecc.)
+             o "—" se non trovato
+    """
     if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
-        return meta, points
-
+        return "—"
+    
     try:
         tdms = TdmsFile.open(tdms_path)
     except Exception:
-        return meta, points
-
+        return "—"
+    
     try:
-        # Scansiona i gruppi PERFORMANCE del test richiesto e prende SOLO i Converted
-        per_point: dict[int, dict[str, float]] = {}
-        for g in tdms.groups():
-            m = GROUP_RE.match(g.name or "")
-            if not m:
-                continue
-            if int(m.group("test")) != int(test_index):
-                continue
-            if (m.group("kind") or "").lower() != "converted":
-                continue
-
-            p = int(m.group("point"))
-            acc = per_point.setdefault(p, {})
-            # media dei canali utili
-            for ch in g.channels():
-                tag = _tag_curve_channel(ch)
-                if not tag:
-                    continue
-                try:
-                    acc[tag] = float(_mean_channel_fast(ch))
-                except Exception:
-                    pass
-
-        # compone i punti solo se entrambi presenti e finiti
-        for p in sorted(per_point.keys()):
-            acc = per_point[p]
-            if "flow" in acc and "tdh" in acc and math.isfinite(acc["flow"]) and math.isfinite(acc["tdh"]):
-                points.append((float(acc["tdh"]), float(acc["flow"])))  # (x=TDH, y=Flow)
-
-        return meta, points
+        # Leggi il gruppo Info_Table
+        info_group = _get_group_ci(tdms, "Info_Table")
+        if not info_group:
+            return "—"
+        
+        # Leggi il canale con l'indice
+        value_channel = _get_channel_ci(info_group, "Power_Calc_Type_Value")
+        if not value_channel:
+            return "—"
+        
+        # Leggi il canale con l'elenco
+        elenco_channel = _get_channel_ci(info_group, "Power_Calc_Type_Elenco")
+        if not elenco_channel:
+            return "—"
+        
+        # Leggi il valore dell'indice
+        try:
+            value_data = value_channel[:]
+        except Exception:
+            value_data = getattr(value_channel, "data", [])
+        
+        index_str = _first_nonempty(value_data)
+        if not index_str:
+            return "—"
+        
+        # Converti in intero
+        try:
+            index_value = int(float(str(index_str).replace(",", ".").strip()))
+        except Exception:
+            return "—"
+        
+        # Leggi l'elenco
+        try:
+            elenco_data = elenco_channel[:]
+        except Exception:
+            elenco_data = getattr(elenco_channel, "data", [])
+        
+        # Converti in lista di stringhe
+        elenco_str = []
+        for x in elenco_data:
+            s = _first_nonempty([x])
+            if s is None:
+                s = ""
+            elenco_str.append(str(s).strip())
+        
+        # Restituisci la stringa corrispondente all'indice
+        # Gestisce sia 0-based che 1-based come per FSG Order
+        n = len(elenco_str)
+        if n == 0:
+            return "—"
+        
+        # Prova 0-based
+        if 0 <= index_value < n:
+            result = elenco_str[index_value]
+            return result if result else "—"
+        
+        # Prova 1-based
+        if 1 <= index_value <= n:
+            result = elenco_str[index_value - 1]
+            return result if result else "—"
+        
+        return "—"
+    
+    except Exception:
+        return "—"
+    
     finally:
         try:
             tdms.close()
         except Exception:
             pass
 
+
+def read_perfor_table_labels(tdms_path: str) -> list:
+    """
+    Legge le intestazioni personalizzate dal canale Perfor_Table_Label in Info_Table.
+    
+    Il canale contiene stringhe nel formato "NOME\r\nUNITA", es:
+      "RPM\r\nrpm" → "RPM [rpm]"
+      "FLOW\r\nm3/h" → "FLOW [m3/h]"
+      "\r\n" → ignorato (campo vuoto)
+    
+    Args:
+        tdms_path: Percorso del file TDMS
+    
+    Returns:
+        list: Lista di intestazioni formattate, o lista vuota se non trovato
+    """
+    if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
+        return []
+    
+    try:
+        tdms = TdmsFile.open(tdms_path)
+    except Exception:
+        return []
+    
+    try:
+        # Leggi il gruppo Info_Table
+        info_group = _get_group_ci(tdms, "Info_Table")
+        if not info_group:
+            return []
+        
+        # Leggi il canale Perfor_Table_Label
+        label_channel = _get_channel_ci(info_group, "Perfor_Table_Label")
+        if not label_channel:
+            return []
+        
+        # Leggi i dati
+        try:
+            label_data = label_channel[:]
+        except Exception:
+            label_data = getattr(label_channel, "data", [])
+        
+        # Processa ogni label
+        headers = []
+        for raw_label in label_data:
+            # Converti in stringa
+            label_str = str(raw_label).strip() if raw_label else ""
+            
+            # Salta campi vuoti
+            if not label_str or label_str == "\r\n":
+                continue
+            
+            # Split su \r\n per separare nome e unità
+            parts = label_str.split("\r\n")
+            
+            if len(parts) >= 2:
+                name = parts[0].strip()
+                unit = parts[1].strip()
+                
+                # Se il nome contiene già le parentesi quadre (es. "MOTOR EFF [%]")
+                # non aggiungere l'unità
+                if "[" in name and "]" in name:
+                    headers.append(name)
+                elif unit:
+                    headers.append(f"{name} [{unit}]")
+                else:
+                    headers.append(name)
+            elif len(parts) == 1:
+                # Solo nome, nessuna unità
+                name = parts[0].strip()
+                if name:
+                    headers.append(name)
+        
+        return headers
+    
+    except Exception:
+        return []
+    
+    finally:
+        try:
+            tdms.close()
+        except Exception:
+            pass
+
+
+def detect_test_types(tdms_path: str) -> list:
+    """
+    Rileva i tipi di test presenti nel file TDMS analizzando i nomi dei gruppi.
+    
+    Pattern gruppi:
+      - 0_X_PERFORMANCE → "PERFORMANCE"
+      - 1_X_NPSH → "NPSH"
+      - 2_X_RUNNING → "RUNNING"
+    
+    Args:
+        tdms_path: Percorso del file TDMS
+    
+    Returns:
+        list: Lista dei tipi di test trovati (es. ["PERFORMANCE", "NPSH"])
+              Ordine: PERFORMANCE, NPSH, RUNNING (se presenti)
+    """
+    if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
+        return []
+    
+    try:
+        tdms = TdmsFile.open(tdms_path)
+    except Exception:
+        return []
+    
+    try:
+        test_types_found = set()
+        
+        for group in tdms.groups():
+            group_name = group.name or ""
+            
+            # Pattern: NUMERO_NUMERO_TIPO
+            # Es: 0_5_PERFORMANCE, 1_3_NPSH, 2_1_RUNNING
+            parts = group_name.split("_")
+            
+            if len(parts) >= 3:
+                prefix = parts[0]  # "0", "1", "2"
+                suffix = parts[2]  # "PERFORMANCE", "NPSH", "RUNNING"
+                
+                # Identifica il tipo in base al prefisso
+                if prefix == "0" and "PERFORMANCE" in suffix.upper():
+                    test_types_found.add("PERFORMANCE")
+                elif prefix == "1" and "NPSH" in suffix.upper():
+                    test_types_found.add("NPSH")
+                elif prefix == "2" and "RUNNING" in suffix.upper():
+                    test_types_found.add("RUNNING")
+        
+        # Restituisci in ordine standard
+        result = []
+        for test_type in ["PERFORMANCE", "NPSH", "RUNNING"]:
+            if test_type in test_types_found:
+                result.append(test_type)
+        
+        return result
+    
+    except Exception:
+        return []
+    
+    finally:
+        try:
+            tdms.close()
+        except Exception:
+            pass
