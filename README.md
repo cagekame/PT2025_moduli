@@ -2,7 +2,6 @@
 
 Riferimento: file principali dell'applicazione avviata da `login.py`.
 
-Nota: la colonna "Ultima modifica" usa il timestamp del filesystem locale (cartella progetto).
 
 | File | A cosa serve | Ultima modifica |
 |---|---|---|
